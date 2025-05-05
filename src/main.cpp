@@ -125,13 +125,49 @@ NB_MODULE(_core, m) {
     m.def("add", [](int a, int b) { return a + b; }, "a"_a, "b"_a);
     m.def("hpx_hello", &hpx_hello);
     m.def("hpx_async_add", &hpx_async_add, "a"_a, "b"_a);
-    m.def("hpx_async", [](const nb::callable& fn)
-    {
-        return hpx::async([fn]() -> nb::object
-        {
+
+    m.def("hpx_async", [](const nb::callable& fn) {
+        // Create HPX future
+        auto hpx_fut = hpx::async([fn]() {
             nb::gil_scoped_acquire acquire;
             return fn();
         });
+        
+        // Always try to get the running loop (we assume we're called from an async context)
+        auto asyncio = nb::module_::import_("asyncio");
+        nb::object loop = asyncio.attr("get_running_loop")();
+        
+        // Create a Python Future on that loop
+        auto py_fut = loop.attr("create_future")();
+        
+        // Keep shared copies to ensure they live long enough
+        auto shared_loop = std::make_shared<nb::object>(loop);
+        auto shared_py_fut = std::make_shared<nb::object>(py_fut);
+        
+        // Attach a continuation to set the result
+        hpx_fut.then([shared_py_fut, shared_loop](hpx::future<nb::object> f) {
+            nb::object result;
+            std::exception_ptr eptr;
+            
+            try {
+                nb::gil_scoped_release release;
+                result = f.get();
+            } catch (...) {
+                eptr = std::current_exception();
+            }
+            
+            nb::gil_scoped_acquire acquire;
+            if (!eptr) {
+                // Schedule setting the result on the asyncio event loop thread.
+                (*shared_loop).attr("call_soon_threadsafe")(
+                    nb::cpp_function([shared_py_fut, result]() {
+                        (*shared_py_fut).attr("set_result")(result);
+                    })
+                );
+            }
+        });
+        
+        return py_fut;
     });
     m.def("init_hpx_runtime", &init_hpx_runtime);
     m.def("stop_hpx_runtime", &stop_hpx_runtime);
